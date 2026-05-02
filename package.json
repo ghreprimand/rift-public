@@ -1,0 +1,19 @@
+{
+  "name": "rift",
+  "version": "1.0.0",
+  "description": "Shared workspace overlay between machines",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "server": "node server/index.js"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/multipart": "^9.4.0",
+    "@fastify/websocket": "^11.2.0",
+    "dotenv": "^17.3.1",
+    "electron": "^41.5.0",
+    "fastify": "^5.8.5"
+  }
+}
