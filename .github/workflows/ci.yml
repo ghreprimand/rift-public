@@ -1,0 +1,65 @@
+name: Rift checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node 24 and Electron / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Isolated fixture paths
+        shell: bash
+        run: |
+          printf 'RIFT_TEST_SCRATCH=%s/rift-tests\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'RIFT_TEST_ARTIFACTS=%s/rift-artifacts\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'ELECTRON_CACHE=%s/electron-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Linux fixture tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg xvfb
+      - name: macOS fixture tools
+        if: runner.os == 'macOS'
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+      - run: npm ci --no-audit --no-fund
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm test
+      - name: Browser checks on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          xvfb-run -a npm run test:organization
+          xvfb-run -a npm run test:organization -- --offline
+          xvfb-run -a npm run test:organization -- --shared
+          xvfb-run -a npm run test:organization -- --dialogs
+          xvfb-run -a npm run test:downloads
+          xvfb-run -a npm run test:downloads -- --legacy-bridge
+          xvfb-run -a npm run test:downloads -- --layout
+          xvfb-run -a npm run test:browser -- --adverse
+          xvfb-run -a npm run test:browser -- --behavior --http1
+      - name: Browser checks on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          npm run test:organization
+          npm run test:organization -- --offline
+          npm run test:organization -- --shared
+          npm run test:organization -- --dialogs
+          npm run test:downloads
+          npm run test:downloads -- --legacy-bridge
+          npm run test:downloads -- --layout
+          npm run test:browser -- --adverse
+          npm run test:browser -- --behavior --http1

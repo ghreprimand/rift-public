@@ -1,19 +1,29 @@
 {
   "name": "rift",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Shared workspace overlay between machines",
+  "private": true,
   "main": "main.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "start": "electron .",
+    "test": "node --test tests/server.test.cjs tests/workspaces.test.cjs",
+    "test:browser": "electron --no-sandbox tests/browser.cjs",
+    "test:downloads": "electron --no-sandbox tests/downloads.cjs",
+    "test:organization": "electron --no-sandbox tests/organization.cjs",
+    "preview": "node tests/preview.cjs",
     "server": "node server/index.js"
   },
   "dependencies": {
-    "@fastify/cookie": "^11.0.2",
+    "@fastify/cookie": "^11.1.5",
     "@fastify/formbody": "^8.0.2",
     "@fastify/multipart": "^9.4.0",
-    "@fastify/websocket": "^11.2.0",
+    "@fastify/websocket": "^11.3.7",
     "dotenv": "^17.3.1",
-    "electron": "^41.5.0",
-    "fastify": "^5.8.5"
+    "electron": "^45.3.0",
+    "fastify": "^5.12.8",
+    "sharp": "0.35.5"
   }
 }

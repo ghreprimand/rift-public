@@ -199,6 +199,7 @@
     .progress-text {
       font-size: 10px; color: rgba(255,140,0,.6); margin-top: 3px;
     }
+    .download-panel, .upload-panel { margin: 0 10px 10px; min-width: 0; }
     .body.img img, .body.img video {
       max-width: 100%; display: block; border-radius: 6px;
     }
@@ -529,6 +530,7 @@
 
     /* Card collapse */
     .card.collapsed .body { display: none; }
+    .card.collapsed .download-panel, .card.collapsed .upload-panel { display: none; }
     .card.collapsed .resize-handle { display: none; }
 
     /* Locked cards */
@@ -574,11 +576,46 @@
     ::-webkit-scrollbar-thumb { background: rgba(255,140,0,.3); border-radius: 5px; min-height: 40px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255,140,0,.5); }
   </style>
+  <link rel="stylesheet" href="/workspaces.css">
 </head>
 <body>
+  <aside id="sidebar" aria-label="Workspaces">
+    <h1 class="app-logo">RIFT</h1>
+    <div class="sidebar-caption">Workspaces</div>
+    <div id="workspace-list"></div>
+    <button id="new-workspace" class="sidebar-action">+ New workspace</button>
+    <button id="collection-active" class="sidebar-action active">Active cards</button>
+    <button id="collection-archive" class="sidebar-action">Archive</button>
+    <button id="collection-trash" class="sidebar-action">Trash</button>
+    <button id="show-transfers" class="sidebar-action">Transfers &amp; drafts</button>
+    <div id="archived-workspaces-label" class="sidebar-caption" hidden>Archived workspaces</div>
+    <div id="archived-workspaces"></div>
+  </aside>
+  <header id="appbar">
+    <div id="tab-row"><nav id="workspace-tabs" role="tablist" aria-label="Open workspaces"></nav><button id="reopen-tab" title="Reopen last closed tab">↶</button></div>
+    <div id="workspace-toolbar">
+      <span id="workspace-title">Inbox</span>
+      <div id="search-bar"><input id="search-input" type="search" placeholder="Search cards…  /" aria-label="Search cards"><span id="search-count"></span></div>
+      <select id="filter-scope" aria-label="Search scope"><option value="workspace">This workspace</option><option value="all">All workspaces</option></select>
+      <button id="filter-toggle" aria-label="Search filters">Filters</button>
+      <div id="filter-options" popover="auto" aria-label="Search filters">
+      <select id="filter-kind" aria-label="Card type"><option value="all">All types</option><option value="text">Notes</option><option value="image">Images</option><option value="file">Files</option><option value="video">Video</option><option value="audio">Audio</option><option value="pdf">PDF</option></select>
+      <select id="filter-sort" aria-label="Sort cards"><option value="newest">Newest</option><option value="oldest">Oldest</option><option value="name">Name</option></select>
+      <input id="filter-after" type="date" aria-label="Added on or after" title="Added on or after">
+      <label id="filter-pinned-label" class="filter-label"><input id="filter-pinned" type="checkbox">Pinned</label>
+      </div>
+      <button id="view-canvas" aria-pressed="true">Canvas</button><button id="view-library" aria-pressed="false">Library</button>
+    </div>
+  </header>
   <div id="viewport">
     <div id="canvas"></div>
+    <div id="library" hidden></div>
   </div>
+  <div id="search-results" aria-label="Search results" hidden></div>
+  <div id="bulk-actions" hidden><span id="bulk-count"></span><select id="bulk-move" aria-label="Move selected cards"></select><button id="bulk-archive">Archive / unarchive</button><button id="bulk-trash">Trash</button></div>
+  <button id="take-control" hidden>Following another device · Take control</button>
+  <div id="sync-status" role="status" aria-live="polite">Connecting…</div>
+  <aside id="transfer-drawer" aria-label="Transfers and recoverable drafts" hidden><div class="drawer-heading"><strong>Transfers &amp; drafts</strong><button id="close-transfers" aria-label="Close transfers">×</button></div><div id="transfer-list"></div></aside>
   <div id="selbox"></div>
   <div id="empty">
     <div class="hint-keys">Ctrl+V / drag files / double-click / scroll to zoom</div>
@@ -649,10 +686,13 @@
       <div class="row"><span class="key">&#x2193; button</span><span class="desc">Export cards as JSON</span></div>
     </div>
   </div>
-  <div id="search-bar"><input id="search-input" type="text" placeholder="Search cards... (Enter/Shift+Enter to cycle)" /><span id="search-count"></span></div>
   <div id="arrange-btn" title="Arrange cards in grid">&#x229E;</div>
   <div id="export-btn" title="Export cards as JSON">&#x2193;</div>
 
+  <script src="/transfers.js"></script>
+  <script src="/markup.js"></script>
+  <script src="/outbox.js"></script>
+  <script src="/workspace-ui.js"></script>
   <script>
   (function() {
     'use strict';
@@ -688,10 +728,33 @@
     // items: id -> { data, el: Element|null }
     //   el is null when the card is offscreen (virtualized out)
     const items = new Map();
+    const previews = new RiftPreviewScheduler(viewport);
+    const uploadJobs = new Map();
+    const uploadQueue = [];
+    let activeUpload = null;
+    const explicitMedia = new Map();
     const groups = new Map();     // groupId -> { id, label, cards: [], width, height, el: Element|null }
     const selected = new Set();   // selected card ids
 
     let ws = null;
+    let organizer;
+    let currentWorkspaceId = 'inbox';
+    let sharedSession = null;
+    let workspaceCatalog = [];
+    let clientId = '';
+    let sessionLease = null;
+    let applyingRemote = false;
+    let viewSequence = 0;
+    let cameraTimer;
+    let cameraIdleTimer;
+    let cameraPadding = { x: 0, y: 0 };
+    const transferHistory = [];
+    const sharedTransfers = new Map();
+    const outbox = new RiftOutbox(message => ws.send(JSON.stringify(message)), () => {
+      statusDot.dataset.pending = outbox.pending.length;
+      if (outbox.warning) toast(outbox.warning);
+      updateOrganization();
+    });
     let dragCounter = 0;
 
     // View state
@@ -768,26 +831,113 @@
       b.className = 'btn';
       b.textContent = text;
       b.title = title;
+      b.setAttribute('aria-label', title);
       return b;
     }
 
     // === Coordinate transforms ===
     function screenToWorld(sx, sy) {
+      const bounds = viewport.getBoundingClientRect();
       return {
-        x: (sx - panX) / zoom,
-        y: (sy - panY) / zoom,
+        x: (sx - bounds.left - panX) / zoom,
+        y: (sy - bounds.top - panY) / zoom,
       };
     }
 
     function randomPos() {
-      const cx = (window.innerWidth / 2 - panX) / zoom;
-      const cy = (window.innerHeight / 2 - panY) / zoom;
+      const cx = (viewport.clientWidth / 2 - panX) / zoom;
+      const cy = (viewport.clientHeight / 2 - panY) / zoom;
       const spread = 300 / zoom;
       return {
         x: cx + (Math.random() - 0.5) * spread,
         y: cy + (Math.random() - 0.5) * spread,
       };
     }
+
+    function activeView() {
+      return sharedSession?.views[currentWorkspaceId] || { camera: null, selection: [], query: '', kind: 'all', scope: 'workspace', pinned: false, collection: 'active', mode: 'canvas', sort: 'newest', transfers: false };
+    }
+
+    function currentCamera() {
+      const width = Math.max(20, (viewport.clientWidth - 2 * cameraPadding.x) / zoom);
+      const height = Math.max(20, (viewport.clientHeight - 2 * cameraPadding.y) / zoom);
+      return { cx: (viewport.clientWidth / 2 - panX) / zoom, cy: (viewport.clientHeight / 2 - panY) / zoom, width, height };
+    }
+
+    function publishView(patch, options = {}) {
+      if (applyingRemote || !sharedSession) return;
+      if (patch.selection) patch.selection = patch.selection.filter(id => !uploadJobs.has(id));
+      Object.assign(activeView(), patch);
+      if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'session', workspaceId: currentWorkspaceId, patch, viewSequence: ++viewSequence, ...options }));
+      updateOrganization(); scheduleVisibility(); updateEmpty();
+    }
+
+    function applySharedView() {
+      if (!sharedSession) return;
+      if (sharedSession.activeWorkspaceId !== currentWorkspaceId) { ws?.send(JSON.stringify({ type: 'hello', version: 2 })); return; }
+      applyingRemote = true;
+      const view = activeView();
+      if (view.camera) {
+        const frame = view.camera;
+        zoom = Math.min(viewport.clientWidth / frame.width, viewport.clientHeight / frame.height);
+        cameraPadding = { x: Math.max(0, (viewport.clientWidth - frame.width * zoom) / 2), y: Math.max(0, (viewport.clientHeight - frame.height * zoom) / 2) };
+        panX = viewport.clientWidth / 2 - frame.cx * zoom;
+        panY = viewport.clientHeight / 2 - frame.cy * zoom;
+        applyTransform();
+      }
+      selected.clear();
+      for (const id of view.selection || []) if (items.has(id)) selected.add(id);
+      for (const [id, item] of items) item.el?.classList.toggle('selected', selected.has(id));
+      // Ensure target card is rendered
+      updateSelIndicator(); updateVisibility(); updateEmpty(); updateOrganization();
+      applyingRemote = false;
+    }
+
+    function matchesView(data) {
+      const view = activeView();
+      if (data.workspaceId && data.workspaceId !== currentWorkspaceId) return false;
+      if (view.collection === 'trash' ? !data.trashedAt : data.trashedAt || (view.collection === 'archive' ? !data.archived : data.archived)) return false;
+      if (view.pinned && !data.pinned) return false;
+      if (view.after && (data.createdAt || 0) < Date.parse(view.after + 'T00:00:00Z')) return false;
+      const kind = data.kind === 'text' ? 'text' : data.mimeType?.startsWith('image/') ? 'image' : data.mimeType?.startsWith('video/') ? 'video' : data.mimeType?.startsWith('audio/') ? 'audio' : data.mimeType?.includes('pdf') ? 'pdf' : 'file';
+      if (view.kind !== 'all' && view.kind !== kind) return false;
+      const query = (view.query || '').normalize('NFKC').toLowerCase();
+      return !query || [data.fileName, data.label, data.kind === 'text' && !data.hidden ? data.content : '', ...[...groups.values()].filter(group => group.cards.includes(data.id)).map(group => group.label)].some(value => String(value || '').normalize('NFKC').toLowerCase().includes(query));
+    }
+
+    function flushEditing() {
+      const editing = document.activeElement;
+      if (editing?.classList.contains('body') && editing.contentEditable === 'true') editing.blur();
+    }
+
+    function updateOrganization() {
+      if (!organizer || !sharedSession) return;
+      organizer.update({ workspaceId: currentWorkspaceId, session: sharedSession, workspaces: workspaceCatalog,
+        items: [...items.values()].map(item => item.data), connected: outbox.connected, pending: outbox.pending.length,
+        warning: outbox.warning, clientId, lease: sessionLease });
+    }
+
+    function reportTransfer(job, kind, state, message) {
+      if (ws?.readyState !== 1 || !sharedSession) return;
+      if (job.sharedState === state && Date.now() - (job.sharedAt || 0) < 250) return;
+      job.sharedState = state; job.sharedAt = Date.now();
+      const terminal = ['completed', 'failed', 'cancelled'].includes(state);
+      ws.send(JSON.stringify({ type: 'transfer', id: kind === 'upload' ? job.key : job.transfer,
+        workspaceId: job.pos?.workspaceId || job.workspaceId || currentWorkspaceId, kind, name: job.name || job.file?.name || 'File',
+        state, message: String(message || state).slice(0, 500), canCancel: !terminal && !job.browserManaged }));
+    }
+
+    function transferRows() {
+      const local = [...[...uploadJobs.values()].map(job => ({ id: job.key, name: job.name, message: job.message, cancel: job.state === 'cancelled' ? null : () => cancelUpload(job), retry: job.state === 'failed' ? () => { job.cancelled = false; uploadState(job, 'queued', 'Queued'); uploadQueue.push(job); pumpUploads(); } : null })),
+        ...[...downloadJobs.values()].map(job => ({ id: job.transfer, name: job.name, message: job.message || 'Preparing download', cancel: job.browserManaged ? null : () => { job.cancelled = true; job.controller?.abort(); if (job.token) window.riftDesktop?.cancelDownload(job.token); } })), ...transferHistory];
+      const own = new Set(local.map(job => job.id));
+      return [...local, ...[...sharedTransfers.values()].filter(job => !own.has(job.id)).map(job => ({ ...job, cancel: job.canCancel ? () => {
+        if (job.kind === 'upload') fetch('/uploads/' + job.id, { method: 'DELETE' }).catch(() => toast('Cancellation could not be confirmed'));
+        else ws?.send(JSON.stringify({ type: 'transferCancel', id: job.id }));
+      } : null }))];
+    }
+
+    function resizeViewport() { applySharedView(); scheduleVisibility(); }
 
     // === View transforms ===
     function applyTransform() {
@@ -800,19 +950,32 @@
       viewport.style.backgroundPosition = panX + 'px ' + panY + 'px';
       viewport.style.backgroundImage = 'radial-gradient(rgba(255,140,0,.06) ' + dotRadius + 'px, transparent ' + dotRadius + 'px)';
 
-      zoomIndicator.textContent = Math.round(zoom * 100) + '%';
+      const frame = currentCamera();
+      zoomIndicator.textContent = Math.round(1200 / frame.width * 100) + '%';
       scheduleVisibility();
+      if (!applyingRemote && sharedSession) {
+        if (!cameraTimer) cameraTimer = setTimeout(() => { cameraTimer = null; publishView({ camera: currentCamera() }); }, 100);
+        clearTimeout(cameraIdleTimer);
+        cameraIdleTimer = setTimeout(() => publishView({ camera: currentCamera() }, { release: true }), 260);
+      }
     }
 
     function setZoom(newZoom, cx, cy) {
+      const bounds = viewport.getBoundingClientRect();
+      cx -= bounds.left; cy -= bounds.top;
       const oldZoom = zoom;
-      zoom = clamp(newZoom, 0.15, 5);
+      const logicalZoom = 1200 / currentCamera().width;
+      zoom = oldZoom * clamp(logicalZoom * newZoom / oldZoom, 0.15, 5) / logicalZoom;
       panX = cx - (cx - panX) * (zoom / oldZoom);
       panY = cy - (cy - panY) * (zoom / oldZoom);
       applyTransform();
     }
 
     function resetView() {
+      if (sharedSession) {
+        publishView({ camera: { cx: 600, cy: 375, width: 1200, height: 750 } }, { takeControl: true, release: true });
+        applySharedView(); return;
+      }
       zoom = 1;
       panX = 0;
       panY = 0;
@@ -825,8 +988,8 @@
       return {
         left: -panX / zoom - RENDER_MARGIN,
         top: -panY / zoom - RENDER_MARGIN,
-        right: (-panX + window.innerWidth) / zoom + RENDER_MARGIN,
-        bottom: (-panY + window.innerHeight) / zoom + RENDER_MARGIN,
+        right: (-panX + viewport.clientWidth) / zoom + RENDER_MARGIN,
+        bottom: (-panY + viewport.clientHeight) / zoom + RENDER_MARGIN,
       };
     }
 
@@ -838,6 +1001,7 @@
     }
 
     function canUnrender(id) {
+      if (uploadJobs.has(id) || downloadJobs.has(id)) return false;
       if (selected.has(id)) return false;
       if (cardDrag && cardDrag.offsets.has(id)) return false;
       const item = items.get(id);
@@ -850,16 +1014,17 @@
     function updateVisibility() {
       const bounds = getViewBounds();
       for (const [id, item] of items) {
-        const shouldShow = isInView(item.data, bounds) || selected.has(id)
-          || (cardDrag && cardDrag.offsets.has(id));
+        const shouldShow = activeView().mode !== 'library' && matchesView(item.data) && (isInView(item.data, bounds) || selected.has(id)
+          || (cardDrag && cardDrag.offsets.has(id)));
         if (shouldShow && !item.el) {
           renderCard(id);
-        } else if (!shouldShow && item.el && canUnrender(id)) {
+        } else if (!shouldShow && item.el && (activeView().mode === 'library' || !matchesView(item.data) || canUnrender(id))) {
           unrenderCard(id);
         }
       }
       // Group visibility: render if any member card is rendered
       for (const [gid, group] of groups) {
+        // Hide group boxes whose rendered cards are all hidden
         const anyRendered = group.cards.some(cid => {
           const it = items.get(cid);
           return it && it.el;
@@ -871,6 +1036,15 @@
         } else if (group.el) {
           updateGroupVisuals(gid);
         }
+      }
+      previews.schedule();
+      canvas.style.display = activeView().mode === 'library' ? 'none' : '';
+      viewport.style.clipPath = activeView().mode === 'library' ? 'none' : `inset(${cameraPadding.y}px ${cameraPadding.x}px)`;
+      for (const close of explicitMedia.values()) if (!close.element.isConnected) close();
+      for (const [id, job] of downloadJobs) if (!items.has(id)) {
+        job.cancelled = true; job.controller?.abort();
+        if (job.token) window.riftDesktop?.cancelDownload(job.token);
+        job.unsubscribe?.(); job.release(); downloadJobs.delete(id);
       }
     }
 
@@ -1077,12 +1251,12 @@
         acts.appendChild(dupBtn);
       }
 
-      const del = makeBtn('\u00D7', 'Delete');
+      const del = makeBtn('\u00D7', 'Move to Trash');
       del.classList.add('del');
       del.onclick = (e) => {
         e.stopPropagation();
         if (data.pinned) { toast('Unpin to delete'); return; }
-        if (confirm('Delete this card?')) deleteCard(data.id);
+        if (confirm('Move this card to Trash?')) deleteCard(data.id);
       };
       acts.appendChild(del);
 
@@ -1136,53 +1310,51 @@
           if (e.key === 'Escape') body.blur();
         });
 
-      } else if (data.mimeType && data.mimeType.startsWith('video/')) {
-        body.classList.add('img');
-        const video = document.createElement('video');
-        video.src = '/files/' + data.id;
-        video.controls = true;
-        video.preload = 'metadata';
-        video.draggable = false;
-        body.appendChild(video);
-
-      } else if (data.mimeType && data.mimeType.startsWith('audio/')) {
+      } else if (data.content && /^(video\/|audio\/|application\/pdf)/.test(data.mimeType || '')) {
         body.classList.add('audio');
-        const audioInfo = document.createElement('div');
-        audioInfo.className = 'audio-info';
-        const icon = document.createElement('span');
-        icon.className = 'ficon';
-        icon.textContent = '\u{1F3B5}';
-        const fname = document.createElement('div');
-        fname.className = 'fname';
-        fname.textContent = data.fileName || 'Audio';
-        audioInfo.appendChild(icon);
-        audioInfo.appendChild(fname);
-        body.appendChild(audioInfo);
-        const audio = document.createElement('audio');
-        audio.src = '/files/' + data.id;
-        audio.controls = true;
-        audio.preload = 'metadata';
-        body.appendChild(audio);
+        const info = document.createElement('div');
+        info.textContent = (data.fileName || 'Attachment') + ' · ' + formatSize(data.fileSize || 0);
+        const open = document.createElement('button');
+        open.textContent = data.mimeType.includes('pdf') ? 'Open PDF' : 'Play';
+        open.className = 'open-preview';
+        body.append(info, open);
+        open.onclick = () => {
+          if (explicitMedia.has(data.id)) { explicitMedia.get(data.id)(); return; }
+          const release = previews.priority();
+          const pdf = data.mimeType.includes('pdf');
+          const media = document.createElement(pdf ? 'embed' : data.mimeType.startsWith('video/') ? 'video' : 'audio');
+          if (pdf) { media.type = 'application/pdf'; media.style.cssText = 'width:100%;height:400px'; }
+          else { media.controls = true; media.preload = 'none'; media.style.width = '100%'; }
+          media.src = '/files/' + encodeURIComponent(data.id);
+          body.appendChild(media);
+          open.textContent = 'Close preview';
+          const close = () => {
+            if (!pdf) media.pause();
+            media.removeAttribute('src');
+            if (!pdf) media.load();
+            media.remove(); release(); explicitMedia.delete(data.id);
+            open.textContent = pdf ? 'Open PDF' : 'Play';
+          };
+          close.element = el;
+          explicitMedia.set(data.id, close);
+          if (!pdf) media.play().catch(() => {});
+        };
 
-      } else if (data.mimeType && data.mimeType.includes('pdf')) {
-        body.classList.add('pdf');
-        const embed = document.createElement('embed');
-        embed.src = '/files/' + data.id;
-        embed.type = 'application/pdf';
-        body.appendChild(embed);
-
-      } else if (data.kind === 'image') {
+      } else if (data.content && data.kind === 'image') {
         body.classList.add('img');
         const img = document.createElement('img');
-        img.src = '/files/' + data.id;
-        img.alt = data.fileName || '';
+        img.dataset.previewId = data.id;
+        img.dataset.previewKey = data.content;
+        img.dataset.filename = data.fileName || '';
+        img.alt = 'Loading preview…';
+        img.style.cssText = 'min-height:100px;object-fit:contain';
         img.draggable = false;
         body.appendChild(img);
 
       } else {
         body.classList.add('file');
         body.onclick = () => {
-          downloadWithProgress(data, el);
+          if (data.content) downloadWithProgress(data, el);
         };
         const icon = document.createElement('span');
         icon.className = 'ficon';
@@ -1299,6 +1471,28 @@
         }
       });
 
+      const secondary = [...acts.children].filter(button => button.tagName === 'BUTTON' && !['Download', 'Copy'].includes(button.title));
+      if (secondary.length) {
+        const menu = document.createElement('div'); menu.className = 'card-menu'; menu.setAttribute('popover', 'auto');
+        secondary.forEach(button => menu.appendChild(button));
+        if (data.content || data.kind === 'text') {
+          const archive = makeBtn('▤', data.archived ? 'Unarchive' : 'Archive');
+          archive.onclick = event => { event.stopPropagation(); send({ type: 'archive', id: data.id, archived: !data.archived }); menu.hidePopover(); };
+          const move = makeBtn('↗', 'Move to workspace');
+          move.onclick = event => {
+            event.stopPropagation();
+            const targets = workspaceCatalog.filter(workspace => workspace.id !== currentWorkspaceId && !workspace.archived);
+            if (!targets.length) { toast('Create another workspace first'); return; }
+            menu.hidePopover();
+            organizer.moveDialog(data);
+          };
+          menu.append(archive, move);
+        }
+        const more = makeBtn('⋯', 'More card actions');
+        more.onclick = event => { event.stopPropagation(); const bounds = more.getBoundingClientRect(); menu.style.left = Math.min(innerWidth - 204, bounds.left) + 'px'; menu.style.top = Math.min(innerHeight - 360, bounds.bottom + 4) + 'px'; menu.togglePopover(); };
+        menu.addEventListener('click', event => { if (event.target.closest('button')) menu.hidePopover(); });
+        acts.append(more, menu);
+      }
       return el;
     }
 
@@ -1321,6 +1515,8 @@
       }
       item.el = el;
       canvas.appendChild(el);
+      const job = uploadJobs.get(id);
+      if (job) uploadState(job, job.state, job.message);
     }
 
     function unrenderCard(id) {
@@ -1330,12 +1526,15 @@
       item.data._h = item.el.offsetHeight;
       item.el.remove();
       item.el = null;
+      explicitMedia.get(id)?.();
+      previews.schedule();
     }
 
     // === Card data management ===
 
     function addCard(data, shouldSend) {
       if (shouldSend === undefined) shouldSend = true;
+      data.workspaceId ||= currentWorkspaceId;
       items.set(data.id, { data: data, el: null });
       // Always render new cards (they're usually at the cursor)
       renderCard(data.id);
@@ -1349,11 +1548,14 @@
       }
       if (shouldSend) send({ type: 'add', item: data });
       updateEmpty();
+      updateOrganization();
       return item.el;
     }
 
     function deleteCard(id) {
+      if (uploadJobs.has(id)) { cancelUpload(uploadJobs.get(id)); return; }
       const item = items.get(id);
+      if (item?.data.pinned) { toast('Unpin to move this card to Trash'); return; }
       if (item && item.data.kind === 'text') {
         const groupId = findGroupForCard(id);
         undoStack.push({ data: { ...item.data }, groupId });
@@ -1374,11 +1576,13 @@
         }
       }
       updateEmpty();
+      scheduleVisibility();
+      updateSelIndicator();
     }
 
     // === Empty state ===
     function updateEmpty() {
-      emptyHint.style.display = items.size === 0 ? '' : 'none';
+      emptyHint.style.display = activeView().mode !== 'library' && ![...items.values()].some(item => matchesView(item.data)) ? '' : 'none';
     }
 
     // === Selection ===
@@ -1417,7 +1621,7 @@
       updateSelIndicator();
     }
 
-    function updateSelIndicator() {
+    function updateSelIndicator(publish = true) {
       if (multiSelectMode || selected.size > 0) {
         let text = '';
         if (multiSelectMode) text += 'MULTI-SELECT ';
@@ -1432,10 +1636,13 @@
         selIndicator.style.display = 'none';
       }
       groupBtn.style.display = selected.size >= 2 ? '' : 'none';
+      if (publish && !applyingRemote && sharedSession) publishView({ selection: [...selected] });
+      updateOrganization();
     }
 
     function selectAll() {
       for (const [id, item] of items) {
+        if (!matchesView(item.data)) continue;
         selected.add(id);
         if (item.el) item.el.classList.add('selected');
       }
@@ -1695,9 +1902,11 @@
         statusDot.className = '';
         statusDot.title = 'Connected';
         reconnectDelay = 1000; // reset on successful connection
+        ws.send(JSON.stringify({ type: 'hello', version: 2 }));
       };
 
       ws.onclose = (e) => {
+        outbox.offline();
         statusDot.className = 'off';
         statusDot.title = 'Disconnected';
         if (e.code === 4001) {
@@ -1716,13 +1925,75 @@
     }
 
     function send(msg) {
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+      const upload = uploadJobs.get(msg.id);
+      if (upload) {
+        if (msg.type === 'move') { upload.pos.x = msg.x; upload.pos.y = msg.y; }
+        else if (msg.type === 'resize') { upload.pos.width = msg.width; upload.pos.height = msg.height; }
+        else toast('Wait for upload confirmation before changing card options');
+        return;
+      }
+      const target = items.get(msg.id)?.data || groups.get(msg.id);
+      const workspaceId = msg.workspaceId || msg.item?.workspaceId || target?.workspaceId || currentWorkspaceId;
+      outbox.enqueue({ ...msg, workspaceId, ...(target?.version !== undefined && { expectedVersion: target.version }) });
     }
 
     function handleServer(msg) {
+      if (msg.type === 'transfer') {
+        sharedTransfers.set(msg.transfer.id, msg.transfer);
+        if (sharedTransfers.size > 100) for (const [id, transfer] of sharedTransfers) if (['completed', 'cancelled', 'failed'].includes(transfer.state)) { sharedTransfers.delete(id); break; }
+        if (['cancelRequested', 'cancelled'].includes(msg.transfer.state)) {
+          const upload = uploadJobs.get(msg.transfer.id);
+          if (upload && upload.state !== 'cancelled') { upload.cancelled = true; upload.xhr?.abort(); uploadState(upload, 'cancelled', 'Cancelled'); upload.file = null; }
+          const download = [...downloadJobs.values()].find(job => job.transfer === msg.transfer.id);
+          if (download && !download.cancelled) { download.cancelled = true; download.controller?.abort(); if (download.token) window.riftDesktop?.cancelDownload(download.token); }
+        }
+        updateOrganization(); return;
+      }
+      if (msg.type === 'sync' && msg.protocolVersion !== 2) return;
+      if (msg.id && msg.version !== undefined) {
+        const target = items.get(msg.id)?.data || groups.get(msg.id);
+        if (target) target.version = msg.version;
+      }
+      if (msg.type === 'catalog') { workspaceCatalog = msg.workspaces; updateOrganization(); return; }
+      if (msg.type === 'session') {
+        if (msg.sourceClientId === clientId && msg.viewSequence < viewSequence) return;
+        sharedSession = msg.session; sessionLease = msg.lease ? { ...msg.lease, until: Date.now() + msg.lease.remainingMs } : null;
+        applySharedView(); return;
+      }
       switch (msg.type) {
+        case 'ack': {
+          const target = items.get(msg.id)?.data || groups.get(msg.id);
+          if (target && msg.version !== undefined) target.version = Math.max(target.version || 0, msg.version);
+          if (target && msg.item) Object.assign(target, msg.item);
+          if (msg.missing && items.has(msg.id)) deleteCardLocal(msg.id);
+          outbox.acknowledge(msg);
+          if (target && msg.item) {
+            for (const operation of outbox.pending) if (!operation.blocked && operation.message.type === 'update' && operation.message.id === msg.id) target.content = operation.message.content;
+            const body = items.get(msg.id)?.el?.querySelector('.body');
+            if (body && target.kind === 'text' && body.contentEditable !== 'true') renderCardBody(body, target);
+          }
+          updateOrganization(); return;
+        }
+        case 'conflict':
+          if (!msg.operationId) { toast(msg.error || 'Shared view update was rejected'); return; }
+          outbox.conflict(msg); toast(msg.error || 'This edit needs review');
+          if (msg.item && items.has(msg.item.id)) {
+            Object.assign(items.get(msg.item.id).data, msg.item);
+            const body = items.get(msg.item.id).el?.querySelector('.body');
+            if (body && msg.item.kind === 'text' && body.contentEditable !== 'true') renderCardBody(body, msg.item);
+          }
+          if (sharedSession) { activeView().transfers = true; updateOrganization(); }
+          return;
         case 'sync':
+          flushEditing();
+          applyingRemote = true;
+          currentWorkspaceId = msg.workspaceId;
+          sharedSession = msg.session;
+          workspaceCatalog = msg.workspaces;
+          clientId = msg.clientId;
+          sharedTransfers.clear(); for (const transfer of msg.transfers || []) sharedTransfers.set(transfer.id, transfer);
           // Clear old elements and state
+          const pendingCards = [...uploadJobs.values()].map(job => job.placeholder || items.get(job.key)?.data).filter(Boolean);
           for (const [, item] of items) { if (item.el) item.el.remove(); }
           items.clear();
           selected.clear();
@@ -1732,6 +2003,22 @@
           for (const data of msg.items) {
             items.set(data.id, { data, el: null });
           }
+          for (const data of pendingCards) {
+            const job = uploadJobs.get(data.id);
+            const confirmed = job && items.get(job.confirmedId);
+            if (confirmed) finishUpload(job, confirmed.data);
+            else if (data.workspaceId === currentWorkspaceId) items.set(data.id, { data, el: null });
+          }
+          for (const op of outbox.pending) {
+            const command = op.message;
+            if ((command.workspaceId || 'inbox') !== currentWorkspaceId || op.blocked) continue;
+            if (command.type === 'add' && !items.has(command.item.id)) items.set(command.item.id, { data: command.item, el: null });
+            const pending = items.get(command.id);
+            if (pending && command.type === 'update') pending.data.content = command.content;
+            if (pending && command.type === 'move') { pending.data.x = command.x; pending.data.y = command.y; }
+            if (pending && ['delete', 'purge'].includes(command.type)) items.delete(command.id);
+            if (pending && command.type === 'archive') pending.data.archived = command.archived;
+          }
           // Store all group data
           if (msg.groups) {
             for (const g of msg.groups) {
@@ -1739,14 +2026,17 @@
                 id: g.id, label: g.label, cards: g.cards || [],
                 width: g.width || null, height: g.height || null,
                 el: null,
+                workspaceId: g.workspaceId,
+                version: g.version,
               });
             }
           }
           // Auto-fit view to content
-          if (items.size > 0) {
+          if ([...items.values()].some(item => matchesView(item.data))) {
             let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
             for (const [, item] of items) {
               const d = item.data;
+              if (!matchesView(d)) continue;
               const w = d.width || 320;
               const h = d.height || 200;
               if (d.x < minX) minX = d.x;
@@ -1758,24 +2048,42 @@
             const cy = (minY + maxY) / 2;
             const contentW = maxX - minX + 80;
             const contentH = maxY - minY + 80;
-            const fitZoom = Math.min(window.innerWidth / contentW, window.innerHeight / contentH, 1);
+            const fitZoom = Math.min(viewport.clientWidth / contentW, viewport.clientHeight / contentH, 1);
             zoom = clamp(fitZoom, 0.15, 1);
-            panX = (window.innerWidth / 2) - cx * zoom;
-            panY = (window.innerHeight / 2) - cy * zoom;
+            panX = (viewport.clientWidth / 2) - cx * zoom;
+            panY = (viewport.clientHeight / 2) - cy * zoom;
             applyTransform();
           }
           // Render visible cards immediately (don't wait for rAF)
           updateVisibility();
           updateEmpty();
+          applyingRemote = false;
+          if (activeView().camera) applySharedView();
+          else {
+            const width = Math.max(600, viewport.clientWidth / zoom);
+            const camera = [...items.values()].some(item => matchesView(item.data))
+              ? { cx: (viewport.clientWidth / 2 - panX) / zoom, cy: (viewport.clientHeight / 2 - panY) / zoom, width, height: width / 1.6 }
+              : { cx: 600, cy: 375, width: 1200, height: 750 };
+            publishView({ camera }, { initial: true, release: true });
+            applySharedView();
+          }
+          if (msg.supportsAck) outbox.ready();
+          updateOrganization();
           break;
         case 'add':
+          if (msg.item.workspaceId && msg.item.workspaceId !== currentWorkspaceId) break;
           if (!items.has(msg.item.id)) {
             items.set(msg.item.id, { data: msg.item, el: null });
             // Render if in view
             const bounds = getViewBounds();
-            if (isInView(msg.item, bounds)) renderCard(msg.item.id);
+            if (matchesView(msg.item) && activeView().mode !== 'library' && isInView(msg.item, bounds)) renderCard(msg.item.id);
             updateEmpty();
           }
+          else Object.assign(items.get(msg.item.id).data, msg.item);
+          for (const job of uploadJobs.values()) if (job.confirmedId === msg.item.id && !job.cancelled) finishUpload(job, msg.item);
+          break;
+        case 'previewReady':
+          previews.refresh(msg.id);
           break;
         case 'move': {
           const item = items.get(msg.id);
@@ -1998,6 +2306,9 @@
           break;
         }
       }
+      scheduleVisibility();
+      updateSelIndicator(false);
+      updateOrganization();
     }
 
     // === Text rendering helpers ===
@@ -2035,7 +2346,7 @@
       html = html.replace(/(?<!href="|">)(https?:\/\/[^\s<"']+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
       // Line breaks (but not after block elements)
       html = html.replace(/\n/g, '<br>');
-      return html;
+      return RiftSafeMarkup(html);
     }
 
     function renderCardBody(body, data) {
@@ -2050,6 +2361,7 @@
 
     // === Mouse handling on viewport (pan, rubber band, deselect) ===
     viewport.addEventListener('mousedown', (e) => {
+      if (activeView().mode === 'library') return;
       if (e.target.closest('.card')) return;
 
       // Right click = pan
@@ -2193,6 +2505,8 @@
       if (panDrag) {
         panDrag = null;
         viewport.style.cursor = '';
+        clearTimeout(cameraTimer); cameraTimer = null; clearTimeout(cameraIdleTimer);
+        publishView({ camera: currentCamera() }, { release: true });
         return;
       }
 
@@ -2205,6 +2519,7 @@
 
     // === Zoom (scroll wheel) ===
     viewport.addEventListener('wheel', (e) => {
+      if (activeView().mode === 'library') return;
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
       setZoom(zoom * factor, e.clientX, e.clientY);
@@ -2219,6 +2534,8 @@
       const isInput = tag === 'INPUT' || tag === 'TEXTAREA';
       const isContentEditable = e.target.contentEditable === 'true';
       const isEditing = isContentEditable || isInput;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); searchInput.focus(); searchInput.select(); return; }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 't') { e.preventDefault(); send({ type: 'tabReopen' }); return; }
 
       // Close help overlay on any key
       if (helpOverlay.classList.contains('visible')) {
@@ -2290,15 +2607,7 @@
           e.preventDefault();
           if (undoStack.length === 0) { toast('Nothing to undo'); return; }
           const entry = undoStack.pop();
-          addCard(entry.data);
-          if (entry.groupId) {
-            const group = groups.get(entry.groupId);
-            if (group) {
-              group.cards.push(entry.data.id);
-              updateGroupVisuals(entry.groupId);
-              send({ type: 'addToGroup', id: entry.groupId, cards: [entry.data.id] });
-            }
-          }
+          send({ type: 'restore', id: entry.data.id, workspaceId: entry.data.workspaceId || currentWorkspaceId });
           toast('Restored card');
           return;
         }
@@ -2319,6 +2628,9 @@
         }
       }
 
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); searchInput.focus(); searchInput.select(); return; }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 't') { e.preventDefault(); send({ type: 'tabReopen' }); return; }
+
       // Escape = deselect all
       if (e.key === 'Escape') {
         multiSelectMode = false;
@@ -2328,7 +2640,7 @@
 
       // Delete/Backspace = delete selected
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selected.size > 0 && confirm('Delete ' + selected.size + ' card' + (selected.size > 1 ? 's' : '') + '?')) {
+        if (selected.size > 0 && confirm('Move ' + selected.size + ' card' + (selected.size > 1 ? 's' : '') + ' to Trash?')) {
           const ids = [...selected];
           for (const id of ids) deleteCard(id);
         }
@@ -2381,13 +2693,13 @@
 
       // +/= = zoom in
       if (e.key === '+' || e.key === '=') {
-        setZoom(zoom * 1.15, window.innerWidth / 2, window.innerHeight / 2);
+        setZoom(zoom * 1.15, viewport.getBoundingClientRect().left + viewport.clientWidth / 2, viewport.getBoundingClientRect().top + viewport.clientHeight / 2);
         return;
       }
 
       // -/_ = zoom out
       if (e.key === '-' || e.key === '_') {
-        setZoom(zoom / 1.15, window.innerWidth / 2, window.innerHeight / 2);
+        setZoom(zoom / 1.15, viewport.getBoundingClientRect().left + viewport.clientWidth / 2, viewport.getBoundingClientRect().top + viewport.clientHeight / 2);
         return;
       }
     }, true);
@@ -2446,6 +2758,7 @@
 
     // === File drag & drop ===
     document.addEventListener('dragenter', (e) => {
+      if (!e.dataTransfer?.types.includes('Files')) return;
       e.preventDefault();
       dragCounter++;
       dropOverlay.classList.add('active');
@@ -2471,165 +2784,282 @@
       }
     });
 
-    async function downloadWithProgress(data, cardEl) {
-      // Find or create progress UI in the card
-      let bar = cardEl.querySelector('.progress-bar');
-      let ptxt = cardEl.querySelector('.progress-text');
-      if (!bar) {
-        const body = cardEl.querySelector('.body');
-        if (!body) return;
-        bar = document.createElement('div');
-        bar.className = 'progress-bar';
-        bar.innerHTML = '<div class="progress-fill"></div>';
-        ptxt = document.createElement('div');
-        ptxt.className = 'progress-text';
-        body.appendChild(bar);
-        body.appendChild(ptxt);
+    const downloadJobs = new Map();
+    let nativeDownloadVersion = 0;
+    window.riftDesktop?.getDownloadVersion?.().then(version => { nativeDownloadVersion = version; }).catch(() => {});
+
+    function downloadStatus(job, message, percent) {
+      job.message = message; job.percent = percent;
+      reportTransfer(job, 'download', message === 'Done' ? 'completed' : message === 'Download cancelled' ? 'cancelled' : job.finished ? 'failed' : 'downloading', message);
+      updateOrganization();
+      const card = items.get(job.id)?.el;
+      if (!card) return;
+      let panel = card.querySelector('.download-panel');
+      if (!panel) {
+        panel = document.createElement('div'); panel.className = 'download-panel';
+        panel.innerHTML = '<div class="progress-bar"><div class="progress-fill"></div></div><div class="progress-text"></div><button>Cancel download</button>';
+        card.querySelector('.body').after(panel);
+        panel.dataset.transfer = job.transfer;
       }
-      const fill = bar.querySelector('.progress-fill');
-      fill.style.width = '0%';
-      ptxt.textContent = 'Choose save location\u2026';
-      bar.style.display = '';
-      ptxt.style.display = '';
+      panel.querySelector('.progress-text').textContent = message;
+      panel.querySelector('.progress-fill').style.width = percent === null ? '50%' : percent + '%';
+      const button = panel.querySelector('button');
+      button.hidden = job.finished;
+      button.textContent = job.browserManaged ? 'Resume previews' : 'Cancel download';
+      button.onclick = e => {
+        e.stopPropagation();
+        if (job.browserManaged) { job.release(); job.finished = true; downloadJobs.delete(job.id); panel.remove(); }
+        else { job.cancelled = true; job.controller?.abort(); if (job.token) window.riftDesktop.cancelDownload(job.token); }
+      };
+    }
 
-      let writable = null;
+    async function downloadWithProgress(data, cardEl) {
+      if (downloadJobs.has(data.id) || !data.content) return;
+      const job = { id: data.id, transfer: uuid(), name: data.fileName || 'File', workspaceId: data.workspaceId || currentWorkspaceId, release: previews.priority(), finished: false, cancelled: false };
+      downloadJobs.set(data.id, job);
+      // Find or create progress UI in the card
+      downloadStatus(job, 'Choose save location…', 0);
+      const initialPanel = cardEl?.querySelector('.download-panel');
+      if (initialPanel) initialPanel.dataset.transfer = job.transfer;
+      const finish = message => {
+        if (job.finished) return;
+        job.finished = true; job.release(); job.unsubscribe?.(); downloadJobs.delete(job.id);
+        transferHistory.unshift({ id: job.transfer, name: data.fileName || 'File', message }); transferHistory.splice(20);
+        downloadStatus(job, message, message === 'Done' ? 100 : 0);
+        if (message === 'Done' || message === 'Download cancelled') setTimeout(() => {
+          const panel = items.get(job.id)?.el?.querySelector('.download-panel');
+          if (panel?.dataset.transfer === job.transfer) panel.remove();
+        }, 2000);
+      };
+      let writable;
+      let reader;
       try {
-        if (window.showSaveFilePicker) {
-          let handle;
-          try {
-            handle = await window.showSaveFilePicker({ suggestedName: data.fileName || 'file' });
-          } catch (err) {
-            if (err && err.name === 'AbortError') {
-              bar.style.display = 'none'; ptxt.style.display = 'none';
-              return;
-            }
-            throw err;
-          }
-          writable = await handle.createWritable();
+        if (window.riftDesktop && nativeDownloadVersion >= 2) {
+          const early = [];
+          const status = event => {
+            if (job.finished) return;
+            if (!job.token) { early.push(event); return; }
+            if (event.token !== job.token) return;
+            const total = Number(event.total) || 0, received = Number(event.received) || 0;
+            if (event.state === 'completed') { finish('Done'); return; }
+            if (event.state === 'cancelled') { finish('Download cancelled'); return; }
+            if (event.state === 'failed' || event.state === 'interrupted') { finish(event.error || 'Download failed. Check authentication and connection.'); return; }
+            downloadStatus(job, event.state === 'choosing' ? 'Choose save location…' : total
+              ? formatSize(received) + ' / ' + formatSize(total) : formatSize(received) + ' downloaded', total ? Math.min(100, received / total * 100) : null);
+          };
+          job.unsubscribe = window.riftDesktop.onDownload(status);
+          job.token = await window.riftDesktop.startDownload(data.id);
+          for (const event of early) status(event);
+          if (job.cancelled) await window.riftDesktop.cancelDownload(job.token);
+          return;
         }
-
-        ptxt.textContent = 'Starting download\u2026';
-        const res = await fetch('/files/' + data.id);
-        if (!res.ok) throw new Error('Download failed');
-        const total = parseInt(res.headers.get('Content-Length'), 10) || data.fileSize || 0;
-        const reader = res.body.getReader();
-        const chunks = writable ? null : [];
+        if (!window.showSaveFilePicker) {
+          if (window.riftDesktop) throw new Error('Quit and reopen Rift to enable reliable native downloads.');
+          // Older desktop clients and browsers use their native streaming download.
+          // Keep previews paused until the user releases them; no original Blob copy.
+          job.browserManaged = true;
+          const a = document.createElement('a');
+          a.href = '/files/' + encodeURIComponent(data.id) + '?download=1';
+          a.download = data.fileName || 'file';
+          document.body.appendChild(a); a.click(); a.remove();
+          downloadStatus(job, 'Download started. Use native download controls where available. Resume previews when finished.', null);
+          return;
+        }
+        const handle = await window.showSaveFilePicker({ suggestedName: data.fileName || 'file' });
+        if (job.cancelled) { finish('Download cancelled'); return; }
+        writable = await handle.createWritable();
+        if (job.cancelled) { await writable.abort(); finish('Download cancelled'); return; }
+        job.controller = new AbortController();
+        downloadStatus(job, 'Starting download…', 0);
+        const res = await fetch('/files/' + encodeURIComponent(data.id), { signal: job.controller.signal, priority: 'high' });
+        if (!res.ok) throw new Error(transferError(res.status, 'Download'));
+        const total = Number(res.headers.get('Content-Length')) || 0;
+        reader = res.body.getReader();
         let received = 0;
-
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (writable) await writable.write(value);
-          else chunks.push(value);
-          received += value.length;
-          if (total) {
-            const pct = Math.min(100, (received / total) * 100);
-            fill.style.width = pct.toFixed(1) + '%';
-            ptxt.textContent = formatSize(received) + ' / ' + formatSize(total) + ' (' + pct.toFixed(0) + '%)';
-          } else {
-            fill.style.width = '50%';
-            ptxt.textContent = formatSize(received) + ' downloaded';
-          }
+          await writable.write(value); received += value.length;
+          downloadStatus(job, total ? formatSize(received) + ' / ' + formatSize(total) : formatSize(received) + ' downloaded', total ? Math.min(100, received / total * 100) : null);
         }
-
-        if (writable) {
-          await writable.close();
-        } else {
-          const blob = new Blob(chunks, { type: data.mimeType || 'application/octet-stream' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = data.fileName || 'file';
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
-        }
-
-        fill.style.width = '100%';
-        ptxt.textContent = 'Done';
-        setTimeout(() => { bar.style.display = 'none'; ptxt.style.display = 'none'; }, 2000);
+        await writable.close(); finish('Done');
       } catch (err) {
-        if (writable) { try { await writable.abort(); } catch {} }
-        fill.style.width = '0%';
-        fill.style.background = 'rgba(248,81,73,.7)';
-        ptxt.textContent = 'Download failed';
-        setTimeout(() => { bar.style.display = 'none'; ptxt.style.display = 'none'; fill.style.background = ''; }, 3000);
-      }
+        job.controller?.abort();
+        if (writable) try { await writable.abort(); } catch {}
+        finish(job.cancelled || err.name === 'AbortError' ? 'Download cancelled' : err.message || 'Download failed');
+      } finally { reader?.releaseLock(); }
     }
 
-    async function uploadFile(file, pos) {
-      // Create a local-only placeholder card with progress bar
-      const placeholderId = uuid();
-      const isImage = file.type && file.type.startsWith('image/');
-      const isVideo = file.type && file.type.startsWith('video/');
-      const isAudio = file.type && file.type.startsWith('audio/');
-      const isPdf = file.type && file.type.includes('pdf');
-      const placeholderWidth = (isImage || isVideo || isPdf) ? 400 : isAudio ? 320 : 240;
-      addCard({
-        id: placeholderId, kind: 'file',
-        content: '', fileName: file.name, fileSize: file.size, mimeType: file.type,
-        x: pos.x, y: pos.y, width: placeholderWidth, height: 0, createdAt: Date.now(),
-      }, false);
-
-      const cardEl = items.get(placeholderId) && items.get(placeholderId).el;
-      let bar, ptxt;
-      if (cardEl) {
-        const body = cardEl.querySelector('.body');
-        if (body) {
-          bar = document.createElement('div');
-          bar.className = 'progress-bar';
-          bar.innerHTML = '<div class="progress-fill"></div>';
-          ptxt = document.createElement('div');
-          ptxt.className = 'progress-text';
-          ptxt.textContent = 'Uploading\u2026';
-          body.appendChild(bar);
-          body.appendChild(ptxt);
-        }
+    function uploadState(job, state, message) {
+      job.state = state;
+      job.message = message;
+      reportTransfer(job, 'upload', state, message);
+      updateOrganization();
+      const el = items.get(job.key)?.el;
+      if (!el) return;
+      el.dataset.uploadState = state;
+      let panel = el.querySelector('.upload-panel');
+      if (!panel) {
+        panel = document.createElement('div');
+        panel.className = 'upload-panel';
+        panel.innerHTML = '<div class="progress-bar"><div class="progress-fill"></div></div><div class="progress-text"></div><button class="upload-cancel">Cancel</button><button class="upload-retry">Retry</button>';
+        el.querySelector('.body').after(panel);
       }
+      panel.querySelector('.progress-text').textContent = message;
+      panel.querySelector('.progress-fill').style.width = (job.percent || 0) + '%';
+      const cancel = panel.querySelector('.upload-cancel');
+      cancel.textContent = state === 'cancelled' ? 'Dismiss' : 'Cancel';
+      cancel.onclick = e => { e.stopPropagation(); if (job.state === 'cancelled') { uploadJobs.delete(job.key); deleteCardLocal(job.key); } else cancelUpload(job); };
+      const retry = panel.querySelector('.upload-retry');
+      retry.hidden = state !== 'failed';
+      retry.onclick = e => { e.stopPropagation(); job.cancelled = false; uploadState(job, 'queued', 'Queued'); uploadQueue.push(job); pumpUploads(); };
+    }
 
-      const form = new FormData();
-      form.append('file', file);
+    function transferError(status, action) {
+      if (status === 401 || status === 403) return 'Authentication expired. Sign in again, then retry.';
+      if (status === 429) return 'Upload rate limit reached. Wait one minute, then retry.';
+      if (status === 413) return 'File exceeds the 100 MiB upload limit.';
+      if (status === 410) return 'Upload was cancelled, deleted, or abandoned. Choose the file again.';
+      return action + ' failed (HTTP ' + status + '). Retry will check for an existing upload first.';
+    }
+
+    async function uploadJSON(url, options) {
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(120000) });
+      if (!res.ok) throw new Error(transferError(res.status, 'Upload'));
+      let result;
+      try { result = await res.json(); } catch { throw new Error('Invalid server response. Retry to reconcile the stored upload.'); }
+      return result;
+    }
+
+    function validUpload(result) {
+      return result && typeof result.id === 'string' && typeof result.storedName === 'string'
+        && typeof result.fileName === 'string' && typeof result.mimeType === 'string'
+        && Number.isSafeInteger(result.fileSize) && result.fileSize >= 0;
+    }
+
+    async function reconcileUpload(job) {
+      const res = await fetch('/uploads/' + job.key, { cache: 'no-store', signal: AbortSignal.timeout(120000) });
+      if (res.status === 404) return null;
+      if (res.status === 202) throw new Error('The server is still receiving this upload. Wait, then retry.');
+      if (!res.ok) throw new Error(transferError(res.status, 'Reconciliation'));
+      const result = await res.json();
+      if (!validUpload(result)) throw new Error('Invalid upload status. No retry was sent.');
+      return result;
+    }
+
+    function sendUpload(job) {
+      return new Promise((resolve, reject) => {
+        const xhr = job.xhr = new XMLHttpRequest();
+        let timer;
+        const idle = () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            job.inactive = true; xhr.abort();
+          }, 120000);
+        };
+        const done = callback => value => { clearTimeout(timer); job.xhr = null; callback(value); };
+        xhr.upload.onprogress = e => {
+          idle();
+          if (e.lengthComputable) {
+            job.percent = Math.min(100, e.loaded / e.total * 100);
+            uploadState(job, e.loaded === e.total ? 'waiting' : 'uploading', e.loaded === e.total
+              ? 'Waiting for server confirmation…' : formatSize(e.loaded) + ' / ' + formatSize(e.total) + ' (' + job.percent.toFixed(0) + '%)');
+          }
+        };
+        xhr.upload.onload = () => { idle(); uploadState(job, 'waiting', 'Waiting for server confirmation…'); };
+        xhr.onprogress = idle;
+        xhr.onload = done(() => {
+          if (xhr.status < 200 || xhr.status >= 300) { reject(new Error(transferError(xhr.status, 'Upload'))); return; }
+          try {
+            const result = JSON.parse(xhr.responseText);
+            if (!validUpload(result)) throw new Error('Invalid upload response');
+            resolve(result);
+          } catch { reject(new Error('Invalid server response. Retry to reconcile the stored upload.')); }
+        });
+        xhr.onerror = done(() => reject(new Error('Connection failed. Retry will check whether the file was stored.')));
+        xhr.onabort = done(() => reject(new Error(job.inactive ? 'No transfer activity for two minutes. Retry to reconcile the stored upload.' : 'Upload cancelled')));
+        xhr.open('POST', '/upload');
+        xhr.setRequestHeader('X-Rift-Upload-Id', job.key);
+        xhr.setRequestHeader('X-Rift-Workspace', job.pos.workspaceId);
+        const form = new FormData(); form.append('file', job.file);
+        idle(); xhr.send(form);
+      });
+    }
+
+    function finishUpload(job, data) {
+      if (job.state === 'completed') return;
+      if (!data || typeof data.id !== 'string' || data.content === undefined) throw new Error('Invalid card confirmation. Retry to reconcile.');
+      job.state = 'completed';
+      deleteCardLocal(job.key);
+      uploadJobs.delete(job.key);
+      reportTransfer(job, 'upload', 'completed', 'Completed');
+      transferHistory.unshift({ id: job.key, name: job.file?.name || job.name, message: 'Completed' }); transferHistory.splice(20);
+      if (data.workspaceId === currentWorkspaceId && !items.has(data.id)) addCard(data, false);
+      toast('Uploaded ' + job.file.name);
+    }
+
+    async function pumpUploads() {
+      if (activeUpload) return;
+      const job = uploadQueue.shift();
+      if (!job) return;
+      if (job.cancelled) { pumpUploads(); return; }
+      activeUpload = job;
+      const release = previews.priority();
       try {
-        const xhr = new XMLHttpRequest();
-        const result = await new Promise((resolve, reject) => {
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable && bar) {
-              const pct = (e.loaded / e.total) * 100;
-              bar.querySelector('.progress-fill').style.width = pct.toFixed(1) + '%';
-              ptxt.textContent = formatSize(e.loaded) + ' / ' + formatSize(e.total) + ' (' + pct.toFixed(0) + '%)';
-            }
-          };
-          xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              resolve(JSON.parse(xhr.responseText));
-            } else {
-              reject(new Error('Upload failed'));
-            }
-          };
-          xhr.onerror = () => reject(new Error('Upload failed'));
-          xhr.open('POST', '/upload');
-          xhr.send(form);
+        if (job.file.size > 100 * 1024 * 1024) throw new Error('File exceeds the 100 MiB upload limit.');
+        uploadState(job, 'uploading', 'Uploading…');
+        let result = job.attempts++ ? await reconcileUpload(job) : null;
+        if (!result) {
+          try { result = await sendUpload(job); }
+          catch (error) {
+            if (job.cancelled) return;
+            // A response can be lost after storage. Reconcile, never blindly resend.
+            result = await reconcileUpload(job);
+            if (!result) throw error;
+          }
+        }
+        if (job.cancelled) return;
+        job.confirmedId = result.id;
+        uploadState(job, 'waiting', 'Waiting for server confirmation…');
+        const confirmed = await uploadJSON('/uploads/' + job.key + '/commit', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job.pos),
         });
-
-        // Remove placeholder, add real card
-        deleteCardLocal(placeholderId);
-        const cardWidth = (isImage || isVideo || isPdf) ? 400 : isAudio ? 320 : 240;
-        addCard({
-          id: result.id,
-          kind: (isImage || isVideo) ? 'image' : 'file',
-          content: result.storedName,
-          fileName: result.fileName,
-          fileSize: result.fileSize,
-          mimeType: result.mimeType,
-          x: pos.x, y: pos.y,
-          width: cardWidth,
-          height: 0, createdAt: Date.now()
-        });
-        toast('Uploaded ' + file.name);
+        if (!job.cancelled) finishUpload(job, confirmed.item);
       } catch (err) {
-        deleteCardLocal(placeholderId);
-        toast('Upload failed');
-      }
+        if (!job.cancelled && job.state !== 'completed') uploadState(job, 'failed', err.message || 'Connection failed. Retry to reconcile.');
+      } finally { release(); activeUpload = null; pumpUploads(); }
+    }
+
+    async function cancelUpload(job) {
+      job.cancelled = true;
+      job.xhr?.abort();
+      uploadState(job, 'cancelled', 'Cancelled. Confirming server cleanup…');
+      const release = previews.priority();
+      try {
+        const res = await fetch('/uploads/' + job.key, { method: 'DELETE', signal: AbortSignal.timeout(120000) });
+        if (res.status === 409) { finishUpload(job, (await res.json()).item); return; }
+        if (!res.ok) throw new Error('Cleanup not confirmed');
+        job.file = null;
+        uploadState(job, 'cancelled', 'Cancelled');
+      } catch {
+        job.cancelled = false;
+        uploadState(job, 'failed', 'Cancellation cleanup could not be confirmed. Press Cancel again. Unattached files expire after 24 hours.');
+      } finally { release(); }
+    }
+
+    function uploadFile(file, pos) {
+      // Create a local-only placeholder card with progress bar
+      const key = uuid();
+      const wide = /^(image\/|video\/|application\/pdf)/.test(file.type);
+      const width = wide ? 400 : file.type.startsWith('audio/') ? 320 : 240;
+      const job = { key, file, name: file.name, pos: { ...pos, width, workspaceId: currentWorkspaceId }, state: 'queued', message: 'Queued', attempts: 0, cancelled: false };
+      uploadJobs.set(key, job);
+      job.placeholder = { id: key, kind: 'file', content: '', fileName: file.name, fileSize: file.size, mimeType: file.type,
+        x: pos.x, y: pos.y, width, height: 0, createdAt: Date.now(), workspaceId: currentWorkspaceId };
+      addCard(job.placeholder, false);
+      uploadState(job, 'queued', 'Queued');
+      uploadQueue.push(job);
+      pumpUploads();
     }
 
     function deleteCardLocal(id) {
@@ -2671,62 +3101,17 @@
     let searchIdx = -1;
 
     function runSearch() {
-      const query = searchInput.value.toLowerCase();
       // Clear previous focus highlight
-      for (const item of items.values()) {
-        if (item.el) item.el.classList.remove('search-focus');
-      }
-      searchResults = [];
-      searchIdx = -1;
-
-      for (const [id, item] of items) {
-        const d = item.data;
-        if (!query) {
-          if (item.el) item.el.classList.remove('search-hidden');
-        } else {
-          const match = (d.content && d.content.toLowerCase().includes(query))
-            || (d.label && d.label.toLowerCase().includes(query))
-            || (d.fileName && d.fileName.toLowerCase().includes(query));
-          if (item.el) item.el.classList.toggle('search-hidden', !match);
-          if (match) searchResults.push(item);
-        }
-      }
-      // Hide group boxes whose rendered cards are all hidden
-      for (const [gid, group] of groups) {
-        if (!group.el) continue;
-        const allHidden = group.cards.every(cid => {
-          const it = items.get(cid);
-          return it && it.el && it.el.classList.contains('search-hidden');
-        });
-        group.el.style.display = allHidden ? 'none' : '';
-      }
-      if (query && searchResults.length > 0) {
-        searchCount.textContent = searchResults.length + ' found';
-      } else if (query) {
-        searchCount.textContent = 'no results';
-      } else {
-        searchCount.textContent = '';
-      }
-      if (searchResults.length > 0) snapToResult(0);
+      for (const item of items.values()) item.el?.classList.remove('search-focus');
+      publishView({ query: searchInput.value, page: 0, libraryAnchor: null });
+      organizer?.refreshSearch();
     }
 
     function snapToResult(idx) {
-      for (const item of items.values()) {
-        if (item.el) item.el.classList.remove('search-focus');
-      }
+      const result = searchResults[idx]?.data;
+      if (!result) return;
       searchIdx = idx;
-      const item = searchResults[idx];
-      if (!item) return;
-      // Ensure target card is rendered
-      if (!item.el) renderCard(item.data.id);
-      if (item.el) item.el.classList.add('search-focus');
-      // Pan canvas to center this card
-      const cx = item.data.x + ((item.data.width || 320) / 2);
-      const cy = item.data.y + ((item.data._h || item.data.height || 200) / 2);
-      panX = (window.innerWidth / 2) - cx * zoom;
-      panY = (window.innerHeight / 2) - cy * zoom;
-      applyTransform();
-      searchCount.textContent = (idx + 1) + ' / ' + searchResults.length;
+      send({ type: 'workspaceActivate', id: result.workspaceId || currentWorkspaceId, focusId: result.id, query: activeView().query, scope: activeView().scope });
     }
 
     searchInput.addEventListener('input', runSearch);
@@ -2915,8 +3300,39 @@
     });
 
     // === Init ===
+    organizer = new RiftWorkspaceUI({
+      command: message => { flushEditing(); send(message); },
+      view: patch => { publishView(patch, { takeControl: true, release: true }); applySharedView(); },
+      scroll: (patch, options) => publishView(patch, options),
+      control: () => publishView({}, { takeControl: true }),
+      focus: data => send({ type: 'workspaceActivate', id: data.workspaceId, focusId: data.id, query: activeView().query, scope: activeView().scope }),
+      download: data => { downloadWithProgress(data, items.get(data.id)?.el); publishView({ transfers: true }); },
+      select: id => selectCard(id, true),
+      size: formatSize,
+      results: results => { searchResults = results.map(data => ({ data })); searchIdx = -1; },
+      transfers: transferRows,
+      conflicts: () => outbox.pending.filter(operation => operation.blocked),
+      recovery: () => outbox.recovery || (outbox.warning ? JSON.stringify(outbox.pending, null, 2) : ''),
+      retry: id => outbox.retry(id), discard: id => { outbox.remove(id); ws?.send(JSON.stringify({ type: 'hello', version: 2 })); },
+    });
     applyTransform();
     connect();
+    window.addEventListener('resize', resizeViewport);
+    window.addEventListener('pagehide', () => {
+      for (const close of explicitMedia.values()) close();
+      for (const job of uploadJobs.values()) {
+        job.xhr?.abort();
+        if (job.state !== 'completed') fetch('/uploads/' + job.key, { method: 'DELETE', keepalive: true }).catch(() => {});
+      }
+      for (const job of downloadJobs.values()) {
+        job.controller?.abort();
+        if (job.token) window.riftDesktop?.cancelDownload(job.token);
+        job.unsubscribe?.(); job.release();
+      }
+      window.removeEventListener('resize', resizeViewport);
+      clearTimeout(cameraTimer);
+      clearTimeout(cameraIdleTimer);
+    }, { once: true });
   })();
   </script>
 </body>

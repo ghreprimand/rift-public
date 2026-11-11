@@ -1,16 +1,19 @@
-const { app, BrowserWindow, Menu, dialog, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, session, shell, ipcMain } = require('electron');
+const { installDownloads } = require('./desktop-downloads');
 
 const SERVER_URL = process.env.RIFT_SERVER_URL || 'http://127.0.0.1:3300';
 
 app.setName('rift');
-app.commandLine.appendSwitch('disable-http-cache');
+// Temporary compatibility option; keep HTTP/2 enabled for normal operation.
+if (process.env.RIFT_HTTP1 === '1') app.commandLine.appendSwitch('disable-http2');
 
-if (process.platform === 'linux') {
+if (process.platform === 'linux' && process.env.RIFT_WAYLAND === '1') {
   app.commandLine.appendSwitch('ozone-platform', 'wayland');
   app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform');
-  app.commandLine.appendSwitch('disable-gpu-sandbox');
-  // Route GL through ANGLE/Vulkan: the native EGL path has DMA-BUF import failures
-  // (EGL_BAD_MATCH) on NVIDIA Wayland with recent driver/Mesa combos.
+}
+
+// Optional graphics compatibility settings; normal operation keeps GPU sandboxing.
+if (process.platform === 'linux' && process.env.RIFT_ANGLE_VULKAN === '1') {
   app.commandLine.appendSwitch('use-gl', 'angle');
   app.commandLine.appendSwitch('use-angle', 'vulkan');
 }
@@ -31,13 +34,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     Menu.setApplicationMenu(null);
 
-    session.defaultSession.on('will-download', async (_event, item) => {
-      item.pause();
-      const { canceled, filePath } = await dialog.showSaveDialog({ defaultPath: item.getFilename() });
-      if (canceled || !filePath) { item.cancel(); return; }
-      item.setSavePath(filePath);
-      item.resume();
-    });
+    installDownloads({ ipcMain, session: session.defaultSession, dialog, serverURL: SERVER_URL });
 
     win = new BrowserWindow({
       width: 1400,
@@ -50,14 +47,18 @@ if (!gotLock) {
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
+        preload: require('node:path').join(__dirname, 'preload.js'),
       },
     });
 
     win.loadURL(SERVER_URL);
 
     win.webContents.setWindowOpenHandler(({ url }) => {
-      shell.openExternal(url);
+      try { if (['https:', 'http:'].includes(new URL(url).protocol)) shell.openExternal(url); } catch { /* Invalid external links stay closed. */ }
       return { action: 'deny' };
+    });
+    win.webContents.on('will-navigate', (event, url) => {
+      try { if (new URL(url).origin !== new URL(SERVER_URL).origin) event.preventDefault(); } catch { event.preventDefault(); }
     });
 
     win.webContents.on('context-menu', (e, params) => {

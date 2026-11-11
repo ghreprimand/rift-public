@@ -1,0 +1,263 @@
+const { app, BrowserWindow, session } = require('electron');
+const { fixture, scratch } = require('./fixture.cjs');
+const fs = require('node:fs');
+const path = require('node:path');
+const { randomUUID } = require('node:crypto');
+const assert = require('node:assert/strict');
+const WS = require('ws');
+const mode = process.argv.includes('--dialogs') ? 'dialogs' : process.argv.includes('--shared') ? 'shared' : process.argv.includes('--offline') ? 'offline' : 'security';
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-dev-shm-usage');
+fs.mkdirSync(scratch, { recursive: true });
+const profile = fs.mkdtempSync(path.join(scratch, 'organization-'));
+app.setPath('userData', profile);
+app.on('window-all-closed', () => {});
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let f, writer, ses, win, second, secondSession, outcome = 0;
+const deadline = setTimeout(() => { f?.terminate(); win?.destroy(); second?.destroy(); app.exit(1); }, 40000);
+app.whenReady().then(async () => {
+  try {
+    f = await fixture({ tls: true });
+    ses = session.fromPartition('organization-' + Date.now());
+    ses.setCertificateVerifyProc((_r, done) => done(0));
+    await ses.cookies.set({ url: f.origin, name: 'rift_token', value: f.token, httpOnly: true, secure: true });
+    win = new BrowserWindow({ show: false, width: 1400, height: 900, webPreferences: { session: ses, sandbox: true, contextIsolation: true, backgroundThrottling: false } });
+    const debug = win.webContents.debugger;
+    debug.attach('1.3');
+    const rendererErrors = [];
+    debug.on('message', (_event, method, params) => { if (method === 'Runtime.exceptionThrown') rendererErrors.push(params.exceptionDetails.exception?.description || params.exceptionDetails.text); });
+    const ready = new Promise(r => win.webContents.once('dom-ready', r));
+    win.loadURL(f.origin).catch(() => {});
+    await ready;
+    await debug.sendCommand('Runtime.enable');
+    const evaluate = async expression => {
+      const r = await debug.sendCommand('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true });
+      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+      return r.result.value;
+    };
+    const waitFor = async expression => {
+      for (let i = 0; i < 200; i++) { if (await evaluate(expression)) return; await sleep(25); }
+      throw new Error('Condition deadline: ' + expression + (rendererErrors.length ? '\n' + rendererErrors.join('\n') : ''));
+    };
+    await waitFor(`document.querySelectorAll('.card').length >= 10`);
+    writer = new WS(f.origin.replace('https', 'wss') + '/ws', { rejectUnauthorized: false, headers: { 'X-Rift-Token': f.token } });
+    writer.on('error', () => {});
+    await new Promise(r => writer.once('open', r));
+    if (mode === 'dialogs') {
+      const click = async selector => {
+        const point = await evaluate(`(() => {const node=document.querySelector(${JSON.stringify(selector)});if(!node)throw new Error('Missing control');node.scrollIntoView({block:'center'});const r=node.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+        await debug.sendCommand('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
+        await debug.sendCommand('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
+      };
+      const key = async (name, code) => {
+        await debug.sendCommand('Input.dispatchKeyEvent', { type: 'keyDown', key: name, code: name, windowsVirtualKeyCode: code, ...(name === 'Enter' && {text:'\r'}) });
+        await debug.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code: name, windowsVirtualKeyCode: code });
+      };
+      const name = async value => {
+        await evaluate(`document.querySelector('#workspace-dialog input').select()`);
+        await debug.sendCommand('Input.insertText', { text: value });
+      };
+      const count = `document.querySelectorAll('#workspace-list .workspace-row').length`;
+      const active = `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent`;
+      const open = async () => { await waitFor(`!document.getElementById('workspace-dialog')`); await click('#new-workspace'); await waitFor(`document.querySelector('#workspace-dialog[open] input')`); };
+      await open();
+      assert.equal(await evaluate(`document.activeElement.id`), 'workspace-dialog-field');
+      await click('#workspace-dialog button[type="submit"]');
+      assert.equal(await evaluate(`document.querySelector('#workspace-dialog [role="alert"]').textContent`), 'Enter a workspace name with 1–80 characters.');
+      assert.equal(await evaluate(count), 1);
+      await name('   '); await key('Enter', 13);
+      assert.equal(await evaluate(count), 1);
+      assert.equal(await evaluate(`document.querySelector('#workspace-dialog').open`), true);
+      await name('Cancelled workspace');
+      await click('#workspace-dialog button[type="button"]');
+      await waitFor(`!document.getElementById('workspace-dialog')`);
+      assert.equal(await evaluate(count), 1);
+      assert.equal(await evaluate(`document.activeElement.id`), 'new-workspace');
+      await open(); await key('Escape', 27);
+      await waitFor(`!document.getElementById('workspace-dialog')`);
+      assert.equal(await evaluate(count), 1);
+      await open();
+      const cardsBefore = await evaluate(`document.querySelectorAll('.card').length`);
+      assert.equal(await evaluate(`(() => {const data=new DataTransfer();data.setData('text/plain','Pasted workspace name');return document.querySelector('#workspace-dialog input').dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:data}))})()`), true, 'default paste must remain available to the input');
+      await sleep(150);
+      assert.equal(await evaluate(`document.querySelectorAll('.card').length`), cardsBefore, 'pasting a workspace name must not create a card');
+      await name('  Project Alpha  '); await key('Enter', 13);
+      await waitFor(`${active}==='Project Alpha'`);
+      assert.equal(await evaluate(count), 2);
+      await open(); await name('project alpha'); await click('#workspace-dialog button[type="submit"]');
+      assert.equal(await evaluate(`document.querySelector('#workspace-dialog [role="alert"]').textContent`), 'A workspace already has that name.');
+      assert.equal(await evaluate(count), 2);
+      await key('Escape', 27); await waitFor(`!document.getElementById('workspace-dialog')`);
+      const workspaceId = await evaluate(`document.querySelector('[role="tab"][aria-selected="true"]').parentElement.dataset.workspace`);
+      await click(`#workspace-list [data-workspace="${workspaceId}"] summary`);
+      await click(`#workspace-list [data-workspace="${workspaceId}"] .workspace-menu button`);
+      await waitFor(`document.querySelector('#workspace-dialog[open] input')?.value==='Project Alpha'`);
+      await name('Renamed project'); await key('Enter', 13);
+      await waitFor(`${active}==='Renamed project'`);
+      await waitFor(`!document.getElementById('workspace-dialog')`);
+      await evaluate(`document.getElementById('input').value='Move this synthetic note';document.getElementById('send-btn').click()`);
+      await waitFor(`document.querySelectorAll('.card').length===1`);
+      const cardId = await evaluate(`document.querySelector('.card').dataset.id`);
+      await click(`.card .btn[title="More card actions"]`);
+      await waitFor(`document.querySelector('.card-menu:popover-open')`);
+      await click(`.card .btn[title="Move to workspace"]`);
+      await waitFor(`document.querySelector('#workspace-dialog[open] select')`);
+      assert.equal(await evaluate(`document.querySelector('#workspace-dialog select').selectedOptions[0].textContent`), 'Inbox');
+      await click('#workspace-dialog button[type="button"]'); await waitFor(`!document.getElementById('workspace-dialog')`);
+      assert.equal(await evaluate(`document.querySelector('.card')?.dataset.id`), cardId);
+      await click(`.card .btn[title="More card actions"]`);
+      await waitFor(`document.querySelector('.card-menu:popover-open')`);
+      await click(`.card .btn[title="Move to workspace"]`);
+      await waitFor(`document.querySelector('#workspace-dialog[open] select')`);
+      await click('#workspace-dialog button[type="submit"]');
+      await waitFor(`${active}==='Inbox'`);
+      await waitFor(`!!document.querySelector('[data-id="${cardId}"]')`);
+      assert.equal(await evaluate(`document.querySelector('[data-id="${cardId}"] .body').textContent`), 'Move this synthetic note');
+      assert.deepEqual(rendererErrors, [], 'dialog actions must not throw renderer errors');
+    } else if (mode === 'security') {
+      const id = randomUUID();
+      writer.send(JSON.stringify({ type: 'add', item: { id, kind: 'text', markdown: true, content: '[Example](https://example.invalid/" data-rift-audit="present)', x: 0, y: 0 } }));
+      await waitFor(`!!document.querySelector('[data-id="${id}"] .body a')`);
+      assert.equal(await evaluate(`document.querySelector('[data-id="${id}"] a').hasAttribute('data-rift-audit')`), false, 'Markdown must not inject link attributes');
+      assert.equal(await evaluate(`document.querySelector('[data-id="${id}"] a').getAttribute('rel')?.includes('noopener')`), true);
+    } else if (mode === 'offline') {
+      f.disconnectClients();
+      await waitFor(`document.getElementById('dot').classList.contains('off')`);
+      await evaluate(`document.getElementById('input').value='synthetic-offline-note';document.getElementById('send-btn').click()`);
+      assert.equal(await evaluate(`Array.from(document.querySelectorAll('.card')).some(el=>el.textContent.includes('synthetic-offline-note'))`), true);
+      await waitFor(`document.getElementById('dot').title==='Connected'`);
+      await sleep(200);
+      assert.equal(await evaluate(`Array.from(document.querySelectorAll('.card')).filter(el=>el.textContent.includes('synthetic-offline-note')).length`), 1, 'one offline note must survive resynchronization');
+      const restarted = new Promise(r => win.webContents.once('dom-ready', r));
+      win.webContents.reload(); await restarted;
+      await waitFor(`Array.from(document.querySelectorAll('.card')).some(el=>el.textContent.includes('synthetic-offline-note'))`);
+      const id = await evaluate(`Array.from(document.querySelectorAll('.card')).find(el=>el.textContent.includes('synthetic-offline-note')).dataset.id`);
+      // Replace only this renderer's transport while a second authenticated
+      // client edits. Reload restores the real WebSocket constructor.
+      await evaluate(`window.WebSocket=class {constructor(){this.readyState=0;setTimeout(()=>{this.readyState=3;this.onclose?.({code:1006})},30)}send(){}close(){this.readyState=3}}`);
+      f.disconnectClients(); await waitFor(`document.getElementById('dot').classList.contains('off')`);
+      await evaluate(`(() => {const body=document.querySelector('[data-id="${id}"] .body');body.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));body.textContent='offline conflict draft';body.dispatchEvent(new FocusEvent('blur'));})()`);
+      writer = new WS(f.origin.replace('https', 'wss') + '/ws', { rejectUnauthorized: false, headers: { 'X-Rift-Token': f.token } });
+      writer.on('error', () => {});
+      const received = []; writer.on('message', raw => received.push(JSON.parse(raw)));
+      await new Promise(r => writer.once('open', r));
+      const operationId = randomUUID();
+      writer.send(JSON.stringify({ type: 'hello', version: 2 }));
+      writer.send(JSON.stringify({ type: 'update', operationId, workspaceId: 'inbox', id, content: 'accepted peer edit' }));
+      for (let i = 0; i < 100 && !received.some(m => m.type === 'ack' && m.operationId === operationId); i++) await sleep(20);
+      assert(received.some(m => m.type === 'ack' && m.operationId === operationId));
+      const readyAgain = new Promise(r => win.webContents.once('dom-ready', r)); win.webContents.reload(); await readyAgain;
+      await waitFor(`document.querySelector('.transfer-row.conflict textarea')?.value==='offline conflict draft'`);
+      assert.equal(await evaluate(`document.querySelector('[data-id="${id}"] .body').textContent`), 'accepted peer edit');
+      await evaluate(`Array.from(document.querySelectorAll('.transfer-row.conflict button')).find(button=>button.textContent==='Keep my edit').click()`);
+      await waitFor(`document.getElementById('sync-status').textContent==='Synced'`);
+      assert.equal(await evaluate(`document.querySelector('[data-id="${id}"] .body').textContent`), 'offline conflict draft');
+    } else {
+      secondSession = session.fromPartition('organization-second-' + Date.now());
+      secondSession.setCertificateVerifyProc((_r, done) => done(0));
+      await secondSession.cookies.set({ url: f.origin, name: 'rift_token', value: f.token, httpOnly: true, secure: true });
+      second = new BrowserWindow({ show: false, width: 1100, height: 720, webPreferences: { session: secondSession, sandbox: true, contextIsolation: true, backgroundThrottling: false } });
+      second.webContents.debugger.attach('1.3');
+      const secondReady = new Promise(r => second.webContents.once('dom-ready', r)); second.loadURL(f.origin).catch(() => {}); await secondReady;
+      const evaluateSecond = async expression => {
+        const result = await second.webContents.debugger.sendCommand('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true });
+        if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+        return result.result.value;
+      };
+      const waitSecond = async expression => {
+        for (let i = 0; i < 200; i++) { if (await evaluateSecond(expression)) return; await sleep(25); }
+        const diagnostic = `({status:document.getElementById('sync-status').textContent,cards:[...document.querySelectorAll('.card .body')].map(b=>({text:b.textContent,editable:b.contentEditable})),outbox:JSON.parse(localStorage.getItem('rift:outbox:v2')||'[]')})`;
+        console.error('ORGANIZATION_DIAGNOSTIC', JSON.stringify({first:await evaluate(diagnostic),second:await evaluateSecond(diagnostic)}));
+        throw new Error('Second client deadline: ' + expression);
+      };
+      await waitSecond(`document.querySelectorAll('.card').length >= 10`);
+      await evaluate(`document.getElementById('new-workspace').click()`);
+      await waitFor(`document.querySelector('#workspace-dialog[open] input')`);
+      await evaluate(`document.querySelector('#workspace-dialog input').value='Project Alpha';document.querySelector('#workspace-dialog form').requestSubmit()`);
+      await waitFor(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent==='Project Alpha'`);
+      await waitSecond(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent==='Project Alpha'`);
+      assert.equal(await evaluateSecond(`document.querySelectorAll('.card').length`), 0, 'inactive Inbox cards must be unmounted');
+      await evaluate(`document.getElementById('input').value='a shared project note';document.getElementById('send-btn').click()`);
+      await waitSecond(`document.querySelectorAll('.card').length===1`);
+      const sharedNoteId = await evaluateSecond(`document.querySelector('.card').dataset.id`);
+      await evaluate(`(() => {const r=document.getElementById('viewport').getBoundingClientRect();document.getElementById('viewport').dispatchEvent(new WheelEvent('wheel',{deltaY:-120,clientX:r.x+r.width/2,clientY:r.y+r.height/2,bubbles:true,cancelable:true}));})()`);
+      await sleep(300);
+      const camera = `(() => {const v=document.getElementById('viewport'),r=v.getBoundingClientRect(),m=new DOMMatrix(getComputedStyle(document.getElementById('canvas')).transform),p=(v.style.clipPath.match(/[\\d.]+/g)||['0','0']).map(Number);return [(p[1]-m.e)/m.a,(p[0]-m.f)/m.a,(r.width-2*p[1])/m.a,(r.height-2*p[0])/m.a];})()`;
+      const firstFrame = await evaluate(camera), secondFrame = await evaluateSecond(camera);
+      firstFrame.forEach((value, i) => assert(Math.abs(value - secondFrame[i]) < 0.2, 'both screen sizes must show the same world rectangle'));
+      await evaluateSecond(`document.getElementById('view-library').click()`);
+      await waitFor(`!document.getElementById('library').hidden`);
+      await waitFor(`document.querySelectorAll('.library-row').length===1`);
+      await evaluate(`document.getElementById('search-input').value='shared project';document.getElementById('search-input').dispatchEvent(new Event('input',{bubbles:true}))`);
+      await waitSecond(`document.getElementById('search-input').value==='shared project'`);
+      await waitSecond(`document.querySelectorAll('.library-row').length===1`);
+      await evaluateSecond(`document.getElementById('take-control').click()`);
+      await sleep(150);
+      await evaluateSecond(`document.querySelector('.library-row input[type="checkbox"]').click()`);
+      await waitFor(`document.querySelector('.library-row input[type="checkbox"]')?.checked===true`);
+      await evaluate(`document.querySelector('.workspace-tab[data-workspace="inbox"] [role="tab"]').click()`);
+      await waitSecond(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent==='Inbox'`);
+      await evaluate(`document.querySelector('[data-workspace]:has([role="tab"]) button[aria-label="Close Project Alpha tab"]').click()`);
+      await waitSecond(`Array.from(document.querySelectorAll('[role="tab"]')).every(tab=>tab.textContent!=='Project Alpha')`);
+      await evaluateSecond(`document.getElementById('reopen-tab').click()`);
+      await waitFor(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent==='Project Alpha'`);
+      await waitFor(`!!document.querySelector('[data-id="${sharedNoteId}"]')`);
+      await f.restart();
+      await waitFor(`document.getElementById('dot').classList.contains('off')`);
+      await waitFor(`document.getElementById('dot').title==='Connected'`); await sleep(200);
+      await waitSecond(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent==='Project Alpha'`);
+      await waitFor(`document.querySelectorAll('.library-row').length===1`);
+      await evaluate(`Array.from(document.querySelectorAll('.library-row button')).find(button=>button.textContent==='Archive').click()`);
+      await waitFor(`document.querySelectorAll('.library-row').length===0`);
+      await evaluateSecond(`document.getElementById('collection-archive').click()`);
+      await waitFor(`document.querySelectorAll('.library-row').length===1`);
+      await evaluate(`Array.from(document.querySelectorAll('.library-row button')).find(button=>button.textContent==='Trash').click()`);
+      await waitFor(`document.querySelectorAll('.library-row').length===0`);
+      await evaluateSecond(`document.getElementById('collection-trash').click()`);
+      await waitFor(`document.querySelectorAll('.library-row').length===1`);
+      await evaluate(`Array.from(document.querySelectorAll('.library-row button')).find(button=>button.textContent==='Restore').click()`);
+      await waitSecond(`document.querySelectorAll('.library-row').length===0`);
+      await evaluateSecond(`document.getElementById('collection-archive').click()`);
+      await waitFor(`document.querySelectorAll('.library-row').length===1`);
+      assert.equal(await evaluate(`document.querySelector('.library-row').dataset.id`), sharedNoteId);
+      await evaluate(`document.getElementById('view-canvas').click()`);
+      await waitSecond(`!!document.querySelector('[data-id="${sharedNoteId}"] .body.text')`);
+      f.faults.dropNextAck = true;
+      await evaluate(`(() => {const body=document.querySelector('[data-id="${sharedNoteId}"] .body.text');body.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));body.textContent='shared project local draft';body.dispatchEvent(new FocusEvent('blur')); })()`);
+      await waitSecond(`document.querySelector('[data-id="${sharedNoteId}"] .body')?.textContent==='shared project local draft'`);
+      await evaluateSecond(`(() => {const body=document.querySelector('[data-id="${sharedNoteId}"] .body.text');body.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));body.textContent='shared project newer peer edit';body.dispatchEvent(new FocusEvent('blur')); })()`);
+      await waitFor(`document.querySelector('[data-id="${sharedNoteId}"] .body')?.textContent==='shared project newer peer edit'`);
+      f.disconnectClients();
+      await waitFor(`document.getElementById('dot').classList.contains('off')`);
+      await waitFor(`document.getElementById('dot').title==='Connected'`);
+      await waitFor(`document.getElementById('sync-status').textContent==='Synced'`);
+      assert.equal(await evaluate(`document.querySelector('[data-id="${sharedNoteId}"] .body').textContent`), 'shared project newer peer edit', 'replayed acknowledgements must not replace a newer peer edit');
+      await evaluate(`document.querySelector('[data-id="${sharedNoteId}"] .btn[title="Unarchive"]').click()`);
+      await waitFor(`!document.querySelector('[data-id="${sharedNoteId}"]')`);
+      await evaluate(`document.getElementById('collection-active').click()`);
+      writer = new WS(f.origin.replace('https', 'wss') + '/ws', { rejectUnauthorized: false, headers: { 'X-Rift-Token': f.token } });
+      writer.on('error', () => {}); await new Promise(r => writer.once('open', r));
+      writer.send(JSON.stringify({ type: 'hello', version: 2 }));
+      const workspaceId = await evaluate(`document.querySelector('[role="tab"][aria-selected="true"]').parentElement.dataset.workspace`);
+      for (let i = 0; i < 20; i++) writer.send(JSON.stringify({ type: 'add', workspaceId, operationId: randomUUID(), item: { id: randomUUID(), kind: 'text', content: 'shared project auxiliary ' + i, x: i * 10, y: i * 10 } }));
+      await evaluate(`document.getElementById('view-library').click()`);
+      await waitFor(`document.querySelectorAll('.library-row').length===21`);
+      await waitSecond(`document.querySelectorAll('.library-row').length===21`);
+      // Hidden diagnostic windows may defer compositor-generated scroll events.
+      await evaluate(`document.getElementById('library').scrollTop=500;document.getElementById('library').dispatchEvent(new Event('scroll'))`);
+      await sleep(400);
+      const firstVisible = `(() => { const library=document.getElementById('library'),top=library.getBoundingClientRect().top; return [...library.querySelectorAll('.library-row')].find(row=>row.getBoundingClientRect().bottom>top)?.dataset.id; })()`;
+      const firstScroll = await evaluate(firstVisible), secondScroll = await evaluateSecond(firstVisible);
+      if (firstScroll !== secondScroll) console.error('ORGANIZATION_DIAGNOSTIC scroll', JSON.stringify({ firstScroll, secondScroll, firstTop: await evaluate(`document.getElementById('library').scrollTop`), secondTop: await evaluateSecond(`document.getElementById('library').scrollTop`) }));
+      assert.equal(firstScroll, secondScroll, 'library scroll must follow the same row on both screen sizes');
+    }
+    console.log('ORGANIZATION_PASS ' + mode);
+  } catch (error) { console.error(error.stack); outcome = 1; }
+  finally {
+    clearTimeout(deadline); writer?.close(); win?.destroy(); second?.destroy(); await ses?.closeAllConnections(); await secondSession?.closeAllConnections();
+    try { await f?.close(); } catch { console.error('Fixture cleanup failed'); outcome = 1; }
+    try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+    catch { console.warn('Temporary Electron profile retained in test scratch'); }
+    app.exit(outcome);
+  }
+});
